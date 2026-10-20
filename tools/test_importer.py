@@ -92,25 +92,161 @@ def test_candidates_need_first_token_and_not_table_rows():
     assert [c.n for c in I.find_candidates([page])] == [1, 4]
 
 
-# ---------------------------------------------------------------- column detection
+# ---------------------------------------------------------------- layout: columns, bands, lead-ins
 
-def test_columns_two_clusters():
-    xs = [54, 58, 61] * 3 + [318, 322, 325] * 3
-    cols = I.detect_columns(xs)
-    assert len(cols) == 2
-    assert cols[0].left == 54 and cols[1].left == 318
+def _doc(pages):
+    """pages: list of [(x, y, text) | ("rule", y) | ("box", x0, y0, x1, y1)]."""
+    doc = pymupdf.open()
+    for items in pages:
+        p = doc.new_page(width=612, height=792)
+        for it in items:
+            if it[0] == "rule":
+                p.draw_line((54, it[1]), (558, it[1]), color=(0, 0, 0), width=0.8)
+            elif it[0] == "box":
+                p.draw_rect(pymupdf.Rect(*it[1:]), color=(0, 0, 0), width=1)
+            else:
+                p.insert_text((it[0], it[1]), it[2], fontsize=10, fontname="helv")
+    return doc
 
 
-def test_columns_single_cluster_with_outliers():
-    xs = [54, 59, 62, 62, 57, 60, 200, 201]
-    cols = I.detect_columns(xs)
-    assert len(cols) == 1 and cols[0].left == 54
+def _question(x, y, n, lines=2, above=False):
+    """A question at (x, y): number, text lines, five choices. Returns (items, bottom y)."""
+    out = [(x, y, f"{n}."), (x + 18, y, "As shown above, what is the answer?" if above else "Consider a block on a ramp.")]
+    out += [(x + 18, y + 14 * (i + 1), "with some more words in the text") for i in range(lines - 1)]
+    y += 14 * lines + 4
+    for letter in "ABCDE":
+        out.append((x + 18, y, f"({letter}) {letter.lower()} value"))
+        y += 14
+    return out, y
 
 
-def test_columns_small_input_uses_largest_cluster():
-    cols = I.detect_columns([54, 55, 56, 300])
-    assert len(cols) == 1 and cols[0].left == 54
-    assert I.nearest_col(cols, 66) == 0 and I.nearest_col(cols, 90) is None
+def _layout(doc):
+    pages = [I.Page(doc[i], i + 1) for i in range(doc.page_count)]
+    anchors, missing = I.locate_anchors(pages)
+    nums = [p.num for p in pages]
+    by_num = {p.num: p for p in pages}
+    lay = I.Layout(by_num, nums, anchors, I.RunningFilter(pages), set())
+    for a in anchors:
+        a.col = lay.col_of(a.page, a.band, a.word.x0)
+    bounds = [I.Boundary("q", a.n, a.n, a.page, a.band, a.col, a.word.y0) for a in anchors]
+    return lay, anchors, {b.n: segs for b, segs in lay.segments(bounds).items()}
+
+
+def test_columns_per_page_and_band():
+    two = []
+    for i, (x, y) in enumerate([(54, 80), (54, 260), (318, 80), (318, 260)]):
+        two += _question(x, y, i + 1)[0]
+    inset = _question(160, 80, 5)[0]
+    wide, _ = _question(54, 80, 6)
+    wide = [(x, y, t + " that runs right across the gutter of the page" if x > 60 and not t.startswith("(") else t)
+            for x, y, t in wide]
+    mixed = wide + [("rule", 220)] + _question(160, 240, 7)[0]
+    lay, anchors, segs = _layout(_doc([two, inset, mixed]))
+    assert [a.n for a in anchors] == list(range(1, 8))
+    assert lay.cols(1, 0) == pytest.approx([54, 318], abs=1)
+    assert lay.cols(2, 0) == pytest.approx([160], abs=1)
+    assert lay.nbands(3) == 2 and len(lay.cols(3, 0)) == 1 and len(lay.cols(3, 1)) == 1
+    (page, box), = segs[6]
+    assert page == 3 and box[2] > 360      # the full-width question isn't cut at the x=318 gutter
+    assert segs[7][0][1][1] > 220          # the inset question starts below the rule
+    for n in (1, 2):
+        assert segs[n][0][1][2] < 318      # left-column crops stay in the left column
+
+
+def test_figure_shown_above_belongs_to_the_next_question():
+    q1, y = _question(54, 80, 1)
+    q2, _ = _question(54, y + 120, 2, above=True)
+    q3, _ = _question(318, 180, 3, above=True)
+    doc = _doc([q1 + [("box", 90, y + 20, 200, y + 100)] + q2 + [("box", 340, 80, 450, 160)] + q3])
+    _, _, segs = _layout(doc)
+    (_, b1), = segs[1]
+    (_, b2), = segs[2]
+    (_, b3), = segs[3]
+    assert b1[3] < y + 20 and b2[1] <= y + 20      # between questions: after (E), it's q2's
+    assert b3[1] <= 80                              # at the top of a column: q3's lead-in
+
+
+def test_graphical_choice_keeps_its_picture():
+    q1, y = _question(54, 80, 1)
+    q1[-1] = (72, y - 14, "(E)")
+    q2, _ = _question(54, y + 120, 2, above=True)
+    doc = _doc([q1 + [("box", 100, y - 22, 180, y + 30)] + q2])
+    _, _, segs = _layout(doc)
+    assert segs[1][0][1][3] >= y + 30               # the (E) drawing stays with q1
+
+
+def test_ocr_tolerance():
+    assert I.anchor_number("14.") == 14 and I.anchor_number("14,") is None
+    assert I.anchor_number("i4.", ocr=True) == 14 and I.anchor_number("25,", ocr=True) == 25
+    assert I.anchor_number("4|.", ocr=True) == 41
+    assert I.anchor_number("II.", ocr=True) is None and I.anchor_number("I.", ocr=True) is None
+    assert I.choice_of("(A)") == "A" and I.choice_of("{B)") == "B" and I.choice_of("(Cc)") == "C"
+    assert I.choice_of("(Be)") is None
+    for t in ("©", "®)", "()", "‘D)", "(BE)", "(B", "A)"):
+        assert I.OCR_CHOICE_RE.match(t), t
+    for t in ("A", "the", "B", "V(x)", "2"):
+        assert not I.OCR_CHOICE_RE.match(t), t
+
+
+def test_sequence_without_question_one():
+    cands = [cand(n, y=100 * n) for n in (2, 3, 4, 5)]
+    run, missing = I.sequence_run(cands, max_skip=4)
+    assert numbers(run) == [2, 3, 4, 5] and missing == [1]
+
+
+def test_gap_filled_from_a_bare_period():
+    q1, y = _question(54, 80, 1)
+    q2, y2 = _question(54, y + 20, 2)
+    q2[0] = (60, q2[0][1], ".")         # OCR kept only the period of "2."
+    q3, _ = _question(54, y2 + 20, 3)
+    lay, anchors, _ = _layout(_doc([q1 + q2 + q3]))
+    found, missing = I.fill_gaps(anchors, [2], lay, lay.pages)
+    assert [a.n for a in found] == [1, 2, 3] and missing == []
+
+
+def test_page_numbers_are_footers():
+    doc = _doc([[(300, 760, "12")], [(300, 760, "- 13 -")]])
+    pages = [I.Page(doc[i], i + 1) for i in range(2)]
+    rf = I.RunningFilter(pages[:1])
+    assert all(rf.is_running(p, ln) for p in pages for ln in p.lines)
+
+
+def _image_page(doc, frac):
+    p = doc.new_page(width=612, height=792)
+    pix = pymupdf.Pixmap(pymupdf.csGRAY, pymupdf.IRect(0, 0, 60, 80), 0)
+    pix.clear_with(200)
+    p.insert_image(pymupdf.Rect(0, 0, 612, 792 * frac), pixmap=pix, keep_proportion=False)
+
+
+def test_mixed_scans_need_ocr():
+    doc = pymupdf.open()
+    for _ in range(3):
+        doc.new_page().insert_text((50, 50), " ".join(["word"] * 60), fontsize=4)
+    for _ in range(4):
+        _image_page(doc, 0.45)
+    assert I.scanned_pages(doc) == {4, 5, 6, 7} and I.needs_ocr(doc)
+    for _ in range(2):
+        doc.new_page().insert_text((50, 50), " ".join(["word"] * 60), fontsize=4)
+    assert not I.needs_ocr(doc)
+
+
+def test_ink_blobs():
+    doc = pymupdf.open()
+    p = doc.new_page(width=612, height=792)
+    p.draw_rect(pymupdf.Rect(200, 300, 260, 340), color=(0, 0, 0), fill=(0, 0, 0))
+    page = I.Page(p, 1)
+    page.scanned = True
+    (box, _), = page.blobs()
+    assert box == pytest.approx((200, 300, 260, 340), abs=2.5)
+
+
+def test_scanned_key_is_never_trusted():
+    ex = {"questions": {}, "expected": 3, "answers": {}, "keyPages": [9], "keyConflicts": [],
+          "overriddenAnswers": set(), "scale": [{"raw": 0, "scaled": 200}], "scaleDups": [], "scalePage": 10,
+          "scaleSource": "text", "rule": ("R", "text"), "time": (120, "text"), "reference": [(1, (0, 0, 1, 1))],
+          "sets": [], "gapPages": {}, "ignore": set(), "keyScanned": True}
+    flags = [f for f in I.validate(ex, None) if f.code == "KEY"]
+    assert [f.target for f in flags] == ["key"] and "scan" in flags[0].detail
 
 
 # ---------------------------------------------------------------- answer key
@@ -370,11 +506,3 @@ def test_crops_stay_clear_of_excluded_marks():
     assert I.clear_of(padded, content, [header_rule]) == (54, 97, 306, 206)
     assert I.clear_of(padded, content, [(54, 203, 300, 203)]) == (54, 94, 306, 202)
     assert I.clear_of(padded, content, [inside]) == padded  # crosses the content: kept
-
-
-def test_pixel_trim_finds_ink():
-    doc = pymupdf.open()
-    p = doc.new_page(width=612, height=792)
-    p.draw_rect(pymupdf.Rect(200, 300, 260, 340), color=(0, 0, 0), fill=(0, 0, 0))
-    box = I.pixel_trim(p, (100, 200, 400, 500))
-    assert box == pytest.approx((194, 294, 266, 346), abs=1)

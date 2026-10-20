@@ -30,8 +30,9 @@ ZOOM = 2.5            # crop render zoom (~180 dpi)
 REVIEW_ZOOM = 1.2     # review overlay zoom
 PAD = 6               # padding around tightened crops (pt)
 LEAD = 4              # regions start this far above their anchor (pt)
-COL_TOL = 15          # an anchor must sit this close to a column's left edge (pt)
 COL_PAD = 8           # columns extend this far left of their leftmost anchor (pt)
+BLANK_WORDS = 20      # pages with fewer words (scratch-work pages) don't count as pages
+BAND = 0.15           # headers and footers live in the top and bottom 15% of the page
 LINE_GAP = 12         # a word this close on the left means "not first on its line" (pt)
 MAX_SET = 8           # larger shared-stem ranges are suspicious
 MAX_REPORT = 25
@@ -39,13 +40,18 @@ MAX_REPORT = 25
 ANCHOR_RE = re.compile(r"^(\d{1,3})\.$")
 GLUED_RE = re.compile(r"^(\d{1,3})\.(?=[A-Za-z(\[])")
 STEM_RE = re.compile(r"^Questions?\s+(\d+)\s*(?:-|–|—|and|through|to)\s*(\d+)", re.I)
-CHOICE_RE = re.compile(r"^\(([A-E])\)")
+CHOICE_RE = re.compile(r"^[({\[]([A-E])[)}\]]|^[({\[](C)c[)}\]]")    # OCR also reads "{B)", "(Cc)"
+# How OCR renders choice labels on scans: "©", "®)", "()", "‘D)", "(BE)", "(B". Never a bare letter.
+OCR_CHOICE_RE = re.compile(r"^(?:[©®@]\)?|\(\)|[(‘'`{\[|]?[A-Ea-e8©@®]{1,2}[)}\]|]|[({\[|][A-Ea-e8©@®]{1,2}[)}\]|]?)$")
+OCR_ANCHOR_RE = re.compile(r"^([0-9ilI|!]{1,3})[.,]$")      # OCR reads "14." as "i4." or "14,"
+OCR_SETTINGS = "pgre-ocr-v2: --deskew --rotate-pages --force-ocr --pages <scanned> --tesseract-pagesegmode 4"
 LETTER_RE = re.compile(r"^\(?([A-E])\)?$")
 KEYNUM_RE = re.compile(r"^\d{1,3}\.?$")
 PPLUS_RE = re.compile(r"^(\d{1,3})%?$")
 FOOTER_RE = re.compile(
-    r"^(go on to the next page\.?|stop\.?|.*\btime is called\b.*|.*\bcheck your work\b.*"
-    r"|.*\bwork on this test\b.*|this test\.|do not turn this page.*)$", re.I)
+    r"^(go\s*on to the next page\.?|stop\.?|.*\btime is called\b.*|.*\bcheck your work\b.*"
+    r"|.*\bwork on this test\b.*|this test\.|do not turn this page.*|scratch work"
+    r"|.*\bunauthorized copying\b.*|.*\bpage is illegal\.?)$", re.I)
 
 KEY_PHRASES = ("answer key", "worksheet", "correct answer")
 SCALE_PHRASES = ("score conversion", "total score")
@@ -136,6 +142,9 @@ class Page:
         self.lines = [Line(sorted(ws, key=lambda w: w.x0)) for ws in groups.values()]
         self._drawings = None
         self._images = None
+        self._rules = None
+        self._blobs = None
+        self.scanned = False
 
     @property
     def text(self):
@@ -159,12 +168,35 @@ class Page:
             self._images = [tuple(i["bbox"]) for i in self.pg.get_image_info()]
         return self._images
 
+    def blobs(self):
+        if self._blobs is None:
+            self._blobs = ink_blobs(self) if self.scanned else []
+        return self._blobs
+
+    def rules(self):
+        """Isolated full-width horizontal lines. They divide a page into stacked bands.
+        On a scan they are thin, page-wide runs of ink."""
+        if self._rules is None:
+            wide = 0.35 if self.scanned else 0.45
+            ds = self.drawings() + [b for b, _ in self.blobs() if b[3] - b[1] <= 4 and b[2] - b[0] >= wide * self.width]
+            self._rules = []
+            for i, r in enumerate(ds):
+                if r[3] - r[1] > (4 if self.scanned else 1.5) or r[2] - r[0] < wide * self.width:
+                    continue
+                if not any(j != i and intersect(grow(d, 3), r) and max(abs(a - b) for a, b in zip(d, r)) > 1
+                           for j, d in enumerate(ds)):
+                    self._rules.append(r)
+        return self._rules
+
+    def band(self, y):
+        return sum(1 for r in self.rules() if r[1] <= y)
+
 
 def band_of(page, box):
     cy = (box[1] + box[3]) / 2
-    if cy < 0.1 * page.height:
+    if cy < BAND * page.height:
         return "top"
-    if cy > 0.9 * page.height:
+    if cy > (1 - BAND) * page.height:
         return "bot"
     return None
 
@@ -202,6 +234,8 @@ class RunningFilter:
         b = band_of(page, ln.bbox)
         if not b:
             return False
+        if re.fullmatch(r"[-–—\s]*\d{1,3}[-–—\s]*", text):     # a page number
+            return True
         best = self.lines.get((b, line_key(text)))
         return best is not None and abs(ln.bbox[1] - best) <= 3
 
@@ -216,25 +250,77 @@ class Item:
     text: str = ""
 
 
-def build_items(page, rf):
+def ink_blobs(page, cell=2.0, thresh=160):
+    """Connected regions of ink on a scanned page as (bbox in PDF points, cell count)."""
+    pix = page.pg.get_pixmap(matrix=pymupdf.Matrix(1, 1), colorspace=pymupdf.csGRAY)
+    img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+    sx, sy = page.width / pix.width, page.height / pix.height
+    gw, gh = max(1, round(pix.width / cell)), max(1, round(pix.height / cell))
+    cells = img.point(lambda v: 255 if v < thresh else 0).resize((gw, gh), Image.BOX).tobytes()
+    seen = bytearray(gw * gh)
+    blobs = []
+    for start in range(gw * gh):
+        if cells[start] <= 20 or seen[start]:
+            continue
+        seen[start] = 1
+        stack, count = [start], 0
+        x0 = x1 = start % gw
+        y0 = y1 = start // gw
+        while stack:
+            j = stack.pop()
+            count += 1
+            x, y = j % gw, j // gw
+            x0, x1, y0, y1 = min(x0, x), max(x1, x), min(y0, y), max(y1, y)
+            for ny in (y - 1, y, y + 1):
+                for nx in (x - 1, x, x + 1):
+                    if 0 <= nx < gw and 0 <= ny < gh:
+                        k = ny * gw + nx
+                        if cells[k] > 20 and not seen[k]:
+                            seen[k] = 1
+                            stack.append(k)
+        cw, ch = pix.width / gw * sx, pix.height / gh * sy
+        blobs.append(((x0 * cw, y0 * ch, (x1 + 1) * cw, (y1 + 1) * ch), count))
+    return blobs
+
+
+def build_items(page, rf, scanned=False):
     """Content items on a page, plus the marks deliberately left out (headers,
-    footers, page rules, column dividers) so crops can be kept clear of them."""
+    footers, page rules, column dividers) so crops can be kept clear of them.
+
+    On a scanned page the text comes from OCR and figures from the ink itself: ink
+    blobs that OCR words don't already cover become drawing items."""
     items, excluded = [], []
     for ln in page.lines:
         if rf.is_running(page, ln):
             excluded += [w.bbox for w in ln.words]
-        else:
-            items += [Item(w.bbox, "w", w.text) for w in ln.words]
+        else:       # OCR turns specks into "." and "'" words
+            items += [Item(w.bbox, "w", w.text) for w in ln.words
+                      if not (scanned and re.fullmatch(r"[\W_]{1,2}", w.text))]
     W, H = page.width, page.height
+    words = [it.bbox for it in items]
+    rules = page.rules()
     for r in page.drawings():
         w, h = r[2] - r[0], r[3] - r[1]
-        if rf.is_running_rect(r) or w * h > 0.4 * W * H or (min(w, h) < 2 and (h > 0.8 * H or w > 0.8 * W)):
-            excluded.append(r)
+        boxed = [b for b in excluded if center_in(b, grow(r, 2))]
+        if rf.is_running_rect(r) or w * h > 0.4 * W * H or (min(w, h) < 2 and (h > 0.8 * H or w > 0.8 * W)) \
+                or r in rules or (boxed and not any(center_in(b, grow(r, 2)) for b in words)):
+            excluded.append(r)      # page furniture, band rules, the box around a footer
         else:
             items.append(Item(r, "d"))
     for r in page.images():
         if area(r) <= 0.6 * W * H:
             items.append(Item(r, "i"))
+    if scanned:
+        all_words = [w.bbox for w in page.words]
+        for box, count in page.blobs():
+            if count < 3 or box[0] < 2 or box[1] < 2 or box[2] > W - 2 or box[3] > H - 2:
+                continue        # specks and scanner edges
+            if box in rules:
+                excluded.append(box)
+                continue
+            covered = sum(area(intersect(box, grow(w, 1)) or (0, 0, 0, 0)) for w in all_words)
+            if covered < 0.5 * area(box):
+                items.append(Item(box, "d"))
     return items, excluded
 
 
@@ -275,13 +361,9 @@ class Cand:
     n: int
     page: int
     word: Word
-    col: int = -1
-
-
-@dataclass
-class Column:
-    edge: float         # median anchor x0
-    left: float         # leftmost anchor x0
+    col: int = 0
+    band: int = 0               # horizontal band of the page (bands are split by full-width rules)
+    rank: int | None = None     # page position, not counting blank or scratch-work pages
 
 
 def voverlap(a, b):
@@ -320,16 +402,45 @@ def looks_like_table_row(w, words):
     return sum(1 for x in t if LETTER_RE.match(x)) >= 3
 
 
-def find_candidates(pages):
+def wraps_in_paragraph(w, words):
+    """A number that starts a wrapped line ("... a factor of / 2. What is ...") lines up
+    with the line below it. A question number hangs: its text is indented past it."""
+    h = w.y1 - w.y0
+    for v in words:
+        if v is w or not (w.y1 <= v.y0 <= w.y1 + 1.5 * h) or abs(v.x0 - w.x0) > 1.5:
+            continue
+        if first_on_line(v, words) and not (ANCHOR_RE.match(v.text) or GLUED_RE.match(v.text)):
+            return True
+    return False
+
+
+def find_candidates(pages, scanned=frozenset()):
     out = []
     for p in pages:
         for w in p.words:
-            m = ANCHOR_RE.match(w.text) or GLUED_RE.match(w.text)
-            if not m or int(m.group(1)) < 1:
+            n = anchor_number(w.text, p.num in scanned)
+            if not n:
                 continue
-            if first_on_line(w, p.words) and not looks_like_table_row(w, p.words):
-                out.append(Cand(int(m.group(1)), p.num, w))
+            if first_on_line(w, p.words) and not looks_like_table_row(w, p.words) \
+                    and not wraps_in_paragraph(w, p.words):
+                out.append(Cand(n, p.num, w))
     return out
+
+
+def choice_of(text):
+    m = CHOICE_RE.match(text)
+    return (m.group(1) or m.group(2)) if m else None
+
+
+def anchor_number(text, ocr=False):
+    m = ANCHOR_RE.match(text) or GLUED_RE.match(text)
+    if m:
+        return int(m.group(1))
+    if ocr:     # needs a real digit, so Roman-numeral statements ("II.") never qualify
+        m = OCR_ANCHOR_RE.match(text)
+        if m and re.search(r"\d", m.group(1)):
+            return int(m.group(1).translate(str.maketrans("ilI|!", "11111")))
+    return None
 
 
 def cluster_positions(xs, gap=20):
@@ -342,28 +453,32 @@ def cluster_positions(xs, gap=20):
     return clusters
 
 
-def detect_columns(xs, min_members=5):
-    """Column left edges from anchor x0 values. Two or more big clusters = multi-column."""
-    clusters = cluster_positions(xs)
-    big = [c for c in clusters if len(c) >= min_members]
-    if not big and clusters:
-        big = [max(clusters, key=len)]
-    return [Column(statistics.median(c), min(c)) for c in big]
+def cluster_of(clusters, x):
+    return next(i for i, c in enumerate(clusters) if c[0] <= x <= c[-1])
 
 
-def nearest_col(cols, x, tol=COL_TOL):
-    if not cols:
-        return None
-    k = min(range(len(cols)), key=lambda i: abs(x - cols[i].edge))
-    return k if tol is None or abs(x - cols[k].edge) <= tol else None
+def assign_page_columns(cands):
+    """Reading order within a page: bands top to bottom, then each band's anchor x0
+    values cluster into its columns."""
+    by_band = defaultdict(list)
+    for c in cands:
+        by_band[(c.page, c.band)].append(c)
+    for cs in by_band.values():
+        clusters = cluster_positions([c.word.x0 for c in cs])
+        for c in cs:
+            c.col = cluster_of(clusters, c.word.x0)
 
 
-MAX_PAGE_JUMP = 3      # the next question is never more than this many pages on
+MAX_PAGE_JUMP = 3      # the next question is never more than this many (non-blank) pages on
 
 
-def _find(cands, i, pred, max_page):
+def _rank(c):
+    return c.page if c.rank is None else c.rank
+
+
+def _find(cands, i, pred, max_rank):
     for j in range(i, len(cands)):
-        if cands[j].page > max_page:
+        if _rank(cands[j]) > max_rank:
             return None
         if pred(cands[j].n):
             return j
@@ -383,26 +498,27 @@ def sequence_run(cands, max_skip=2):
     """Best run of anchors numbered 1, 2, 3, ... in reading order.
 
     A candidate is accepted only if its number is the last accepted + 1 and it is at
-    most MAX_PAGE_JUMP pages on. If a later number (up to `max_skip` ahead) comes
-    first and is itself followed by its successor before the wanted number shows up,
-    the wanted number was missed: skip it and record it as missing.
+    most MAX_PAGE_JUMP non-blank pages on. If a later number (up to `max_skip` ahead)
+    comes first and is itself followed by its successor before the wanted number shows
+    up, the wanted number was missed: skip it and record it as missing.
 
     The run with the most question-like anchors wins (table rows from worksheets and
-    answer sheets don't count), less one per jump over a page with no anchors; ties
-    go to the latest start (front-matter lists that merge into the real exam).
-    Returns (accepted, missing_numbers).
+    answer sheets don't count), less one per jump over a non-blank page with no
+    anchors; ties go to the latest start (front-matter lists that merge into the real
+    exam). Returns (accepted, missing_numbers).
     """
     best = None
+    first = 1 if any(c.n == 1 for c in cands) else 1 + max_skip     # OCR can lose "1." too
     for s, c in enumerate(cands):
-        if c.n != 1:
+        if c.n > first or (first == 1 and c.n != 1):
             continue
-        acc, missing, i = [c], [], s + 1
+        acc, missing, i = [c], list(range(1, c.n)), s + 1
         while i < len(cands):
-            want, limit = acc[-1].n + 1, acc[-1].page + MAX_PAGE_JUMP
+            want, limit = acc[-1].n + 1, _rank(acc[-1]) + MAX_PAGE_JUMP
             j = _find(cands, i, lambda n: n == want, limit)
             g = _find(cands, i, lambda n: want < n <= want + max_skip, limit)
             if g is not None and (j is None or g < j):
-                conf = _find(cands, g + 1, lambda n: n == cands[g].n + 1, cands[g].page + MAX_PAGE_JUMP)
+                conf = _find(cands, g + 1, lambda n: n == cands[g].n + 1, _rank(cands[g]) + MAX_PAGE_JUMP)
                 if (conf is None and j is None) or (conf is not None and (j is None or j > conf)):
                     missing += range(want, cands[g].n)
                     acc.append(cands[g])
@@ -412,33 +528,114 @@ def sequence_run(cands, max_skip=2):
                 break
             acc.append(cands[j])
             i = j + 1
-        jumps = sum(1 for a, b in zip(acc, acc[1:]) if b.page - a.page > 1)
+        jumps = sum(1 for a, b in zip(acc, acc[1:]) if _rank(b) - _rank(a) > 1)
         key = (_question_like(acc) - jumps, s)
         if best is None or key > best[0]:
             best = (key, acc, missing)
     return (best[1], best[2]) if best else ([], [])
 
 
-def locate_anchors(pages):
-    cands = find_candidates(pages)
-    prov = detect_columns([c.word.x0 for c in cands])
-    kept = []
+def locate_anchors(pages, scanned=frozenset()):
+    rank, r = {}, 0
+    for p in pages:
+        r += len(p.words) >= BLANK_WORDS
+        rank[p.num] = r
+    by_num = {p.num: p for p in pages}
+    cands = find_candidates(pages, scanned)
     for c in cands:
-        k = nearest_col(prov, c.word.x0)
-        if k is not None:
-            c.col = k
-            kept.append(c)
-    kept.sort(key=lambda c: (c.page, c.col, c.word.y0))
-    accepted, missing = sequence_run(kept)
-    if len(accepted) < 2:
-        return [], [], []
-    cols = detect_columns([a.word.x0 for a in accepted])
-    for a in accepted:
-        a.col = nearest_col(cols, a.word.x0, tol=None)
-    for k, col in enumerate(cols):
-        xs = [a.word.x0 for a in accepted if a.col == k]
-        col.left = min(xs) if xs else col.left
-    return accepted, missing, cols
+        c.rank = rank[c.page]
+        c.band = by_num[c.page].band(c.word.y0)
+    assign_page_columns(cands)
+    cands.sort(key=lambda c: (c.page, c.band, c.col, c.word.y0))
+    accepted, missing = sequence_run(cands, max_skip=4 if scanned else 2)
+    return (accepted, missing) if len(accepted) >= 2 else ([], [])
+
+
+def layout_slots(layout, t):
+    """The (band, column) a line start sits in, if it is near that column's question numbers."""
+    num, b, col, _, w = t
+    lefts = layout.cols(num, b)
+    return [(b, col)] if lefts and -5 <= w.x0 - lefts[col] <= 25 else []
+
+
+def after_choices(span, layout):
+    """Line starts that open a new question: the first unindented, non-choice line after
+    a run of choice lines (x measured from each column's edge)."""
+    out, last = [], None
+    for t in span:
+        num, b, col, _, w = t
+        rel = w.x0 - layout.cols(num, b)[col]
+        label = choice_of(w.text) or (num in layout.ocr and OCR_CHOICE_RE.match(w.text))
+        if label:
+            last = rel
+        elif last is not None and not STEM_RE.match(w.text):
+            if rel <= last + 3:
+                out.append(t)
+                last = None
+        elif STEM_RE.match(w.text):
+            last = None
+    return out
+
+
+def fill_gaps(anchors, missing, layout, by_num):
+    """Recover question numbers OCR lost, from structure: every question ends with an
+    (E) choice. Between found anchors n and m there must be exactly m - n (E) labels;
+    question n+i then starts at the first unindented line after the i-th (E) block.
+    Gaps that don't add up stay missing."""
+    if not missing:
+        return anchors, missing
+    starts = []         # line-start words in reading order
+    for num in sorted({a.page for a in anchors} | set(layout.exam_nums)):
+        p = by_num.get(num)
+        if not p or not layout.items(num):
+            continue
+        for w in p.words:
+            if first_on_line(w, p.words) and not layout.rf.is_running(p, Line([w])):
+                b = p.band(w.y0)
+                starts.append((num, b, layout.col_of(num, b, w.x0), w.y0, w))
+    starts.sort(key=lambda t: t[:4])
+    pos = {id(t[4]): i for i, t in enumerate(starts)}
+    found, still = list(anchors), []
+    by_n = {a.n: a for a in anchors}
+    gaps = defaultdict(list)
+    for n in missing:
+        lo = max((a.n for a in anchors if a.n < n), default=None)
+        hi = min((a.n for a in anchors if a.n > n), default=None)
+        gaps[(lo, hi)].append(n)
+    for (lo, hi), ns in gaps.items():
+        if lo is None or hi is None or id(by_n[lo].word) not in pos or id(by_n[hi].word) not in pos:
+            still += ns
+            continue
+        span = starts[pos[id(by_n[lo].word)] + 1:pos[id(by_n[hi].word)]]
+        # OCR sometimes keeps only the period of a number: ". A cylindrical tube ..."
+        dots = [t for t in span if re.fullmatch(r"[.,:;]", t[4].text) and t[1:3] in layout_slots(layout, t)
+                and following_tokens(t[4], by_num[t[0]].words, 1)]
+        if len(dots) == hi - lo - 1:
+            found += [Cand(lo + 1 + k, num, w, col, b) for k, (num, b, col, _, w) in enumerate(dots)]
+            continue
+        after = after_choices(span, layout)
+        if len(after) == hi - lo - 1:
+            found += [Cand(lo + 1 + k, num, w, col, b) for k, (num, b, col, _, w) in enumerate(after)]
+            continue
+        es = [i for i, t in enumerate(span) if choice_of(t[4].text) == "E"]
+        if len(es) != hi - lo:
+            still += ns
+            continue
+        new = []
+        for k, i in enumerate(es[:-1]):
+            e = span[i][4]
+            nxt = next((t for t in span[i + 1:] if t[4].x0 <= e.x0 + 3 and not choice_of(t[4].text)
+                        and not STEM_RE.match(t[4].text)), None)
+            if nxt is None:
+                break
+            num, b, col, _, w = nxt
+            new.append(Cand(lo + 1 + k, num, w, col, b))
+        if len(new) == hi - lo - 1:
+            found += new
+        else:
+            still += ns
+    found.sort(key=lambda a: a.n)
+    return found, sorted(still)
 
 
 # ---------------------------------------------------------------- regions
@@ -449,23 +646,69 @@ class Boundary:
     n: int              # question number, or the set's first question
     last: int
     page: int
+    band: int
     col: int
     y0: float
 
 
 class Layout:
-    def __init__(self, pages, exam_nums, cols, rf, ocr):
+    """Where each question's crop comes from.
+
+    A page is a stack of bands split by full-width rules. A band holds one or more
+    columns: the book's usual column layout (the clusters of anchor x0 that share a
+    band most often), or its own columns when its anchors sit elsewhere, such as a
+    single question in an inset column. A band whose content runs across the gutter
+    is one full-width column.
+    """
+
+    def __init__(self, pages, exam_nums, anchors, rf, ocr):
         self.pages = pages              # num -> Page
         self.exam_nums = exam_nums      # sorted page numbers
-        self.cols = cols
         self.rf = rf
-        self.ocr = ocr
+        self.ocr = ocr                  # scanned page numbers: OCR text plus ink blobs
         self._items = {}
+        self._cols = {}
         self.area_top = {}
+        self.clusters = cluster_positions([a.word.x0 for a in anchors])
+        self.in_band = defaultdict(list)
+        for a in anchors:
+            self.in_band[(a.page, a.band)].append(a)
+        combos = defaultdict(int)
+        for group in self.in_band.values():
+            ids = frozenset(self.cluster(a) for a in group)
+            if len(ids) > 1:
+                combos[ids] += 1
+        if combos:
+            self.standard = set(max(combos, key=lambda k: (combos[k], len(k))))
+        else:
+            self.standard = {max(range(len(self.clusters)), key=lambda i: len(self.clusters[i]))} if self.clusters else set()
+        self.standard_lefts = [self.clusters[i][0] for i in sorted(self.standard)]
+        # Scanned pages shift sideways (left and right pages of a book). Estimate each
+        # page's shift from its own anchors, or a same-parity neighbour's.
+        self.offset = {}
+        for num in exam_nums:
+            deltas = [min(a.word.x0 for g in self.in_band for a in self.in_band[g] if g[0] == num and self.cluster(a) == i)
+                      - self.clusters[i][0] for i in self.standard
+                      if any(g[0] == num and self.cluster(a) == i for g in self.in_band for a in self.in_band[g])]
+            if deltas:
+                self.offset[num] = statistics.median(deltas)
+        for num in exam_nums:
+            if num not in self.offset:
+                near = sorted((abs(n - num), n) for n in self.offset if (n - num) % 2 == 0)
+                self.offset[num] = self.offset[near[0][1]] if near else 0.0
+        for num in exam_nums:
+            if abs(self.offset[num]) < 15:
+                self.offset[num] = 0.0
+
+    def page_lefts(self, num):
+        return [x + self.offset.get(num, 0.0) for x in self.standard_lefts]
+
+    def cluster(self, a):
+        return cluster_of(self.clusters, a.word.x0)
 
     def items(self, num):
         if num not in self._items:
-            self._items[num] = build_items(self.pages[num], self.rf)
+            self._items[num] = build_items(self.pages[num], self.rf, num in self.ocr)
         return self._items[num][0]
 
     def excluded(self, num):
@@ -480,22 +723,84 @@ class Layout:
         return union(i.bbox for i in its)
 
     def bottom(self, num):
-        b = self.content_box(num)[3] + PAD
-        if self.ocr:
-            b = max(b, 0.9 * self.pages[num].height - 2)
-        return min(b, self.pages[num].height)
+        return min(self.content_box(num)[3] + PAD, self.pages[num].height)
 
-    def col_range(self, num, k):
-        left = self.cols[k].left - COL_PAD
-        if k + 1 < len(self.cols):
-            right = self.cols[k + 1].left - COL_PAD - 2
-        else:
-            right = self.content_box(num)[2] + PAD
-        return max(0, left), min(self.pages[num].width, right)
+    # bands
+
+    def nbands(self, num):
+        return len(self.pages[num].rules()) + 1
+
+    def band_range(self, num, b):
+        p = self.pages[num]
+        edges = [0.0] + sorted(r[1] for r in p.rules()) + [p.height]
+        return edges[b], edges[b + 1]
+
+    def band_items(self, num, b):
+        y0, y1 = self.band_range(num, b)
+        return [it for it in self.items(num) if y0 <= (it.bbox[1] + it.bbox[3]) / 2 < y1]
+
+    def band_box(self, num, b):
+        its = self.band_items(num, b)
+        return union(i.bbox for i in its) if its else None
+
+    def band_limits(self, num, b):
+        """Top and bottom of a band's content, or None if it has none."""
+        box = self.band_box(num, b)
+        if not box:
+            return None
+        y0, y1 = self.band_range(num, b)
+        top = max(box[1], self.area_top.get(num, box[1])) - LEAD
+        bot = box[3] + PAD
+        top, bot = max(top, y0), min(bot, y1)
+        return (top, bot) if bot - top > 2 else None
+
+    # columns
+
+    def cols(self, num, b):
+        if (num, b) not in self._cols:
+            self._cols[(num, b)] = self._band_cols(num, b)
+        return self._cols[(num, b)]
+
+    def _band_cols(self, num, b):
+        anchors = self.in_band.get((num, b), [])
+        ids = {self.cluster(a) for a in anchors}
+        if ids and not ids <= self.standard:
+            return [min(a.word.x0 for a in anchors if self.cluster(a) == i) for i in sorted(ids)]
+        if len(ids) > 1 or (len(self.standard_lefts) > 1 and self._split_by_gutters(num, b)):
+            return self.page_lefts(num)
+        if anchors:
+            return [min(a.word.x0 for a in anchors)]
+        box = self.band_box(num, b)
+        return [box[0] if box else 0.0]
+
+    def _split_by_gutters(self, num, b):
+        """Content on both sides of every gutter and nothing running across one."""
+        its = self.band_items(num, b)
+        for left in self.page_lefts(num)[1:]:
+            g = left - 3
+            if any(it.bbox[0] < g - 1 and it.bbox[2] > g + 1 for it in its):
+                return False
+            if not any(it.bbox[2] <= g for it in its) or not any(it.bbox[0] >= g for it in its):
+                return False
+        return True
+
+    def col_of(self, num, b, x):
+        lefts = self.cols(num, b)
+        return max([k for k, left in enumerate(lefts) if left - (COL_PAD if k == 0 else 3) <= x + 2] or [0])
+
+    def col_range(self, num, b, k):
+        lefts = self.cols(num, b)
+        box = self.band_box(num, b) or self.content_box(num)
+        W = self.pages[num].width
+        if len(lefts) == 1:         # a single column spans the band
+            return max(0, min(lefts[0] - COL_PAD, box[0] - PAD)), min(W, box[2] + PAD)
+        left = lefts[k] - (COL_PAD if k == 0 else 3)
+        right = lefts[k + 1] - 4 if k + 1 < len(lefts) else box[2] + PAD
+        return max(0, left), min(W, right)
+
+    # crops
 
     def tighten(self, num, region):
-        if self.ocr:
-            return pixel_trim(self.pages[num].pg, region)
         boxes = boxes_in(self.items(num), region)
         if not boxes:
             return region
@@ -505,54 +810,119 @@ class Layout:
     def has_content(self, num, region):
         return bool(boxes_in(self.items(num), region))
 
+    def tail_split(self, num, region):
+        """Where a complete question's content ends inside its region, or None.
+
+        Used when the next question says "above": its figure may sit right after this
+        question's (E) choice. The split is the first gap of 5 pt or more below the
+        (E) row; a graphical (E) choice is one connected block, so it stays put."""
+        its = [it for it in self.items(num) if (center_in(it.bbox, region) if it.kind == "w" else intersect(it.bbox, region))]
+        starts = self.choice_starts(num, region)
+        complete = self.complete(num, region)
+        if not starts or not (complete or (num in self.ocr and len(starts) >= 2)):
+            return None
+        e = starts[-1]
+        end = max([it.bbox[3] for it in its if it.bbox[1] < e.y1 and it.bbox[3] > e.y0] + [e.y1])
+        gaps = []
+        for y0, y1 in sorted((it.bbox[1], it.bbox[3]) for it in its if it.bbox[1] >= e.y0):
+            if y0 > end + 5:
+                if complete:
+                    return y0
+                gaps.append((y0 - end, y0))
+            end = max(end, y1)
+        # A scan whose labels OCR lost: the true (E) row may be below the last label
+        # seen, so take the widest gap instead of the first.
+        best = max(gaps, default=None)
+        return best[1] if best and best[0] >= 8 else None
+
+    def says_above(self, num, x0, x1, y):
+        words = [it.text for it in self.items(num) if it.kind == "w" and center_in(it.bbox, (x0, y - 2, x1, y + 80))]
+        return "above" in words or "above." in words or "above," in words or "above?" in words
+
+    def choice_starts(self, num, box):
+        """Words that start a line and look like a choice label, top to bottom. On
+        scans OCR misreads labels ("©)", "(BE)"), so any label shape counts."""
+        p = self.pages[num]
+        pattern = OCR_CHOICE_RE if num in self.ocr else CHOICE_RE
+        out = [w for w in p.words if center_in(w.bbox, box) and (choice_of(w.text) or pattern.match(w.text))
+               and first_on_line(w, p.words)]
+        return sorted(out, key=lambda w: w.y0)
+
+    def complete(self, num, box):
+        """The box holds a full set of answer choices."""
+        if len(self.choice_letters(num, box)) == 5:
+            return True
+        return num in self.ocr and len(self.choice_starts(num, box)) >= 4
+
+    def choice_letters(self, num, box):
+        return {choice_of(it.text) for it in self.items(num)
+                if it.kind == "w" and choice_of(it.text) and center_in(it.bbox, box)}
+
     def segments(self, bounds):
-        """Map each boundary to its segments [(page, bbox)]."""
+        """Map each boundary to its segments [(page, bbox)], walking slots (page, band,
+        column) in reading order.
+
+        Content above a slot's first boundary is a lead-in, such as a figure "shown
+        above" its question, unless the previous boundary still lacks some of its
+        answer choices (or is a set stem): then it is that boundary's continuation."""
         grid = defaultdict(list)
-        for b in bounds:
-            grid[(b.page, b.col)].append(b)
+        for bd in bounds:
+            grid[(bd.page, bd.band, bd.col)].append(bd)
         for v in grid.values():
-            v.sort(key=lambda b: b.y0)
-        out = {}
-        for (num, k), col in grid.items():
-            x0, x1 = self.col_range(num, k)
-            for i, b in enumerate(col):
-                y1 = col[i + 1].y0 - LEAD if i + 1 < len(col) else self.bottom(num)
-                segs = [(num, self.tighten(num, (x0, b.y0 - LEAD, x1, y1)))]
-                if i + 1 == len(col):
-                    cont = self.continuation(num, k, grid)
-                    if cont:
-                        segs.append(cont)
-                out[b] = segs
+            v.sort(key=lambda bd: bd.y0)
+        out, prev, prev_region = {}, None, None
+        for num in self.exam_nums:
+            if not self.items(num):
+                continue        # blank and scratch-work pages
+            for b in range(self.nbands(num)):
+                lim = self.band_limits(num, b)
+                if not lim:
+                    continue
+                top, bot = lim
+                for k in range(len(self.cols(num, b))):
+                    x0, x1 = self.col_range(num, b, k)
+                    col = [bd for bd in grid.get((num, b, k), []) if bd.y0 - LEAD < bot]
+                    starts = [bd.y0 - LEAD for bd in col]
+                    for i in range(len(col) - 1):
+                        if col[i].kind == "q" and self.says_above(num, x0, x1, col[i + 1].y0):
+                            split = self.tail_split(num, (x0, starts[i], x1, starts[i + 1]))
+                            if split is not None:
+                                starts[i + 1] = split - LEAD
+                    lead = (x0, top, x1, starts[0] if col else bot)
+                    has_lead = lead[3] - top > 2 and self.has_content(num, lead)
+                    if (not has_lead and col and col[0].kind == "q" and prev is not None and prev.kind == "q"
+                            and len(out[prev]) == 1 and self.says_above(num, x0, x1, col[0].y0)):
+                        # Its figure "above" ended the previous column or page.
+                        pnum, (px0, py0, px1, py1) = prev_region
+                        split = self.tail_split(pnum, (px0, py0, px1, py1))
+                        if split is not None:
+                            out[prev] = [(pnum, self.tighten(pnum, (px0, py0, px1, split - LEAD)))]
+                            carried = (pnum, self.tighten(pnum, (px0, split - LEAD, px1, py1)))
+                            col_first_extra = carried
+                        else:
+                            col_first_extra = None
+                    else:
+                        col_first_extra = None
+                    if has_lead:
+                        wants_more = prev is not None and len(out[prev]) == 1 and (
+                            prev.kind == "set" or not self.complete(*out[prev][0]))
+                        if wants_more and col and col[0].kind == "q" and self.says_above(num, x0, x1, col[0].y0):
+                            wants_more = False      # "shown above": it's this question's figure
+                        if wants_more:
+                            out[prev].append((num, self.tighten(num, lead)))
+                        elif col:
+                            starts[0] = top
+                    for i, bd in enumerate(col):
+                        y1 = starts[i + 1] if i + 1 < len(col) else bot
+                        out[bd] = [(num, self.tighten(num, (x0, starts[i], x1, y1)))]
+                        if i == 0 and col_first_extra:
+                            out[bd].insert(0, col_first_extra)
+                        prev, prev_region = bd, (num, (x0, starts[i], x1, y1))
+        for bd in bounds:       # anything outside a band with content keeps its own line
+            if bd not in out:
+                x0, x1 = self.col_range(bd.page, bd.band, bd.col)
+                out[bd] = [(bd.page, self.tighten(bd.page, (x0, bd.y0 - LEAD, x1, self.bottom(bd.page))))]
         return out
-
-    def continuation(self, num, k, grid):
-        """Content above the first boundary of the next column/page slot."""
-        slots = [(num, j) for j in range(k + 1, len(self.cols))]
-        if num + 1 in self.exam_nums:
-            slots.append((num + 1, 0))
-        for sn, sk in slots:
-            x0, x1 = self.col_range(sn, sk)
-            first = grid.get((sn, sk))
-            top = self.area_top.get(sn, self.content_box(sn)[1]) - LEAD
-            bot = first[0].y0 - LEAD if first else self.bottom(sn)
-            region = (x0, top, x1, bot)
-            if bot - top > 2 and self.has_content(sn, region):
-                return (sn, self.tighten(sn, region))
-            if first or self.has_content(sn, (x0, 0, x1, self.pages[sn].height)):
-                return None
-        return None
-
-
-def pixel_trim(pg, region, thresh=200):
-    pix = pg.get_pixmap(matrix=pymupdf.Matrix(ZOOM, ZOOM), clip=pymupdf.Rect(region),
-                        colorspace=pymupdf.csGRAY)
-    img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
-    box = img.point(lambda v: 255 if v < thresh else 0).getbbox()
-    if not box:
-        return region
-    trimmed = (region[0] + box[0] / ZOOM, region[1] + box[1] / ZOOM,
-               region[0] + box[2] / ZOOM, region[1] + box[3] / ZOOM)
-    return intersect(grow(trimmed, PAD), region) or region
 
 
 def find_stems(layout, pages):
@@ -562,9 +932,9 @@ def find_stems(layout, pages):
             m = STEM_RE.match(ln.text.strip())
             if not m or layout.rf.is_running(p, ln):
                 continue
-            x = ln.bbox[0]
-            k = max([i for i, c in enumerate(layout.cols) if c.left - COL_PAD <= x + 2] or [0])
-            out.append(Boundary("set", int(m.group(1)), int(m.group(2)), p.num, k, ln.bbox[1]))
+            b = p.band(ln.bbox[1])
+            k = layout.col_of(p.num, b, ln.bbox[0])
+            out.append(Boundary("set", int(m.group(1)), int(m.group(2)), p.num, b, k, ln.bbox[1]))
     return out
 
 
@@ -771,7 +1141,9 @@ def find_scale(pages, after):
 
 PENALTY_RE = re.compile(
     r"one[-\s]?(?:fourth|quarter)|¼|\b[a-z]\s*/\s*4\b"
-    r"|(?:subtract\w*|minus|deduct\w*)\W+(?:\w+\W+){0,4}1\s*[/⁄]\s*4", re.I)
+    r"|(?:subtract\w*|minus|deduct\w*)\W+(?:\w+\W+){0,4}1\s*[/⁄]\s*4"
+    r"|\bdivid\w*\b.{0,60}\bby (?:4|four)\b|\b(?:correction|adjustment)(?: made)? for guessing\b"
+    r"|\bC\s*[-–—−]\s*[I1l|]\s*/\s*4\b", re.I)
 NO_PENALTY_RE = re.compile(
     r"nothing is (?:subtracted|deducted)|no (?:penalty|deduction)s? for (?:wrong|incorrect|guess)"
     r"|not (?:be )?penalized for (?:wrong|incorrect|guess)", re.I)
@@ -940,6 +1312,10 @@ def validate(ex, layout):
     flags = []
     qs, N = ex["questions"], ex["expected"]
     nums = sorted(qs)
+    # ETS sometimes prints "90. THIS ITEM WAS NOT SCORED.": no key, no choices.
+    unscored = {n for n in nums if re.search(r"\bnot\s+scored\b", " ".join(
+        it.text for num, box in qs[n]["segments"] for it in layout.items(num)
+        if it.kind == "w" and center_in(it.bbox, box)), re.I)}
 
     # Count and numbering
     if N is None:
@@ -948,17 +1324,22 @@ def validate(ex, layout):
         flags.append(Flag("COUNT", "count", f"found={len(qs)} expected={N}"))
     for n in range(1, (max(nums) if nums else 0) + 1):
         if n not in qs:
-            flags.append(Flag("NUM_GAP", f"q{n}", "missing", page=ex["gapPages"].get(n),
+            nxt = next((m for m in nums if m > n), None)
+            hint = f"; its content is likely inside q{nxt:03d}'s crop, so fix both" if nxt else ""
+            flags.append(Flag("NUM_GAP", f"q{n}", "missing" + hint, page=ex["gapPages"].get(n),
                               pages=[ex["gapPages"][n]] if n in ex["gapPages"] else []))
 
     # Answer key
     key_page = ex["keyPages"][0] if ex["keyPages"] else None
     span = range(1, (N or (max(nums) if nums else 0)) + 1)
-    missing = [n for n in span if n not in ex["answers"]]
+    missing = [n for n in span if n not in ex["answers"] and n not in unscored]
     bad = [n for n in span if n in ex["answers"] and ex["answers"][n].get("answer") not in list("ABCDE")]
     conflicts = [n for n in ex["keyConflicts"] if n not in ex["overriddenAnswers"]]
     kp = [key_page] if key_page else []
-    if not ex["answers"]:
+    if not ex["answers"] and ex.get("keyScanned"):
+        flags.append(Flag("KEY", "key", f"key page is a scan: enter answers 1-{len(span)} in overrides.json "
+                                        "from this overlay (OCR is not trusted for answers)", page=key_page, pages=kp))
+    elif not ex["answers"]:
         flags.append(Flag("KEY", "key", "answer key not found", page=key_page, pages=kp))
     elif len(missing) > 5:
         flags.append(Flag("KEY", "key", f"found={len(span) - len(missing)}/{len(span)} "
@@ -1020,10 +1401,19 @@ def validate(ex, layout):
         q = qs[n]
         segs = q["segments"]
         page = segs[0][0]
+        if n in unscored:
+            continue
         letters = []
         for num, box in segs:
-            letters += [CHOICE_RE.match(it.text).group(1) for it in layout.items(num)
-                        if it.kind == "w" and CHOICE_RE.match(it.text) and center_in(it.bbox, box)]
+            letters += [choice_of(it.text) for it in layout.items(num)
+                        if it.kind == "w" and choice_of(it.text) and center_in(it.bbox, box)]
+        scanned = all(num in layout.ocr for num, _ in segs)
+        if scanned and sorted(letters) != list("ABCDE"):
+            # OCR misreads choice labels, so count label-like line starts instead:
+            # flag only graphical or clipped choices (<=2) and merged questions (>=7).
+            looks = sum(len(layout.choice_starts(num, box)) for num, box in segs)
+            if 3 <= looks <= 6 and len(letters) == len(set(letters)):
+                letters = list("ABCDE")
         if sorted(letters) != list("ABCDE"):
             if not letters:
                 detail = "found=0 (graphical choices?)"
@@ -1037,8 +1427,13 @@ def validate(ex, layout):
             continue
         for num, box in segs:
             h = box[3] - box[1]
-            if med and (h > 2.2 * med or (h < 0.35 * med and len(segs) == 1)):
-                flags.append(Flag("HEIGHT", f"q{n}", f"h={h:.0f}pt ({h / med:.1f}x median)",
+            # A tall crop holding exactly (A)-(E) and nothing after its (E) block is
+            # a big figure or graphical choices, not a broken region.
+            clean = sorted(letters) == list("ABCDE") and layout.tail_split(num, box) is None
+            tall = h > 2.2 * med and not clean
+            if med and (tall or (h < 0.35 * med and len(segs) == 1)):
+                extra = ", content after (E)" if tall and sorted(letters) == list("ABCDE") else ""
+                flags.append(Flag("HEIGHT", f"q{n}", f"h={h:.0f}pt ({h / med:.1f}x median{extra})",
                                   page=num, pages=[num]))
                 break
         if len(segs) > 1:
@@ -1097,11 +1492,10 @@ def render_overlay(pg, boxes, path):
         d.line([(M - (10 if v % 50 == 0 else 4), Y(v)), (M - 1, Y(v))], fill=blue)
         if v % 50 == 0:
             d.text((1, Y(v) + 1), str(v), fill=blue, font=font)
-    for label, box, color in boxes:     # labels go top-right, clear of printed numbers
+    for label, box, color in boxes:     # labels sit above the top-right corner, off the text
         d.rectangle([X(box[0]), Y(box[1]), X(box[2]), Y(box[3])], outline=color, width=2)
         tw = d.textlength(label, font=font)
-        at = (X(box[2]) - tw - 4, Y(box[1]) + 3)
-        d.rectangle(grow(d.textbbox(at, label, font=font), 1), fill="white")
+        at = (X(box[2]) - tw - 2, max(M, Y(box[1]) - 13))
         d.text(at, label, fill=color, font=font)
     img.save(path)
 
@@ -1165,15 +1559,23 @@ def report(exam_id, ex, flags, ocr):
 
 # ---------------------------------------------------------------- pipeline
 
-def needs_ocr(doc):
-    scanned = 0
+def scanned_pages(doc):
+    """Pages that are images with (almost) no text layer. A page can be several images."""
+    out = set()
     for pg in doc:
         if len(pg.get_text("words")) >= 50:
             continue
         a = pg.rect.width * pg.rect.height
-        if any(area(i["bbox"]) >= 0.5 * a for i in pg.get_image_info()):
-            scanned += 1
-    return scanned > doc.page_count / 2
+        if sum(area(intersect(i["bbox"], tuple(pg.rect)) or (0, 0, 0, 0)) for i in pg.get_image_info()) >= 0.4 * a:
+            out.add(pg.number + 1)
+    return out
+
+
+def needs_ocr(doc):
+    """Scans outnumber text pages. Books can mix them: typeset front matter, scanned test."""
+    rich = sum(1 for pg in doc if len(pg.get_text("words")) >= 50)
+    scanned = len(scanned_pages(doc))
+    return scanned >= 3 and scanned > rich
 
 
 def open_pdf(pdf):
@@ -1189,22 +1591,43 @@ def open_pdf(pdf):
 
 
 def text_layer(pdf, out):
+    """Returns (doc, scanned page numbers). Scanned pages are cropped by pixels."""
     doc = open_pdf(pdf)
     ocr_pdf = out / "source-ocr.pdf"
     if not needs_ocr(doc):
-        return doc, False
-    if not (ocr_pdf.exists() and ocr_pdf.stat().st_mtime >= pdf.stat().st_mtime):
+        return doc, set()
+    scanned = scanned_pages(doc)
+    if not ocr_is_current(ocr_pdf, pdf, scanned):
         exe = shutil.which("ocrmypdf")
         if not exe:
             raise Fatal("scanned PDF needs OCR but ocrmypdf is not installed (brew install ocrmypdf)")
-        cmd = [exe, "--deskew", "--rotate-pages", str(pdf), str(ocr_pdf)]
+        # OCR exactly the scanned pages, so typeset pages (often the answer key) keep
+        # their own text. psm 4 (one column of variable-size text) keeps far more
+        # question numbers on low-resolution scans than tesseract's default.
+        cmd = [exe, "--deskew", "--rotate-pages", "--force-ocr", "--pages", ",".join(map(str, sorted(scanned))),
+               "--tesseract-pagesegmode", "4", "--output-type", "pdf", str(pdf), str(ocr_pdf)]
         r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode == 6:       # page already has text
-            r = subprocess.run([exe, "--force-ocr"] + cmd[1:], capture_output=True, text=True)
         if r.returncode != 0:
             tail = (r.stderr.strip().splitlines() or ["?"])[-1]
             raise Fatal(f"ocrmypdf failed (exit {r.returncode}): {tail}")
-    return open_pdf(ocr_pdf), True
+        marked = pymupdf.open(ocr_pdf)
+        marked.set_metadata({**marked.metadata, "keywords": ocr_key(scanned)})
+        marked.saveIncr()
+        marked.close()
+    return open_pdf(ocr_pdf), scanned
+
+
+def ocr_key(scanned):
+    return f"{OCR_SETTINGS} pages={','.join(map(str, sorted(scanned)))}"
+
+
+def ocr_is_current(ocr_pdf, pdf, scanned):
+    if not ocr_pdf.exists() or ocr_pdf.stat().st_mtime < pdf.stat().st_mtime:
+        return False
+    try:
+        return pymupdf.open(ocr_pdf).metadata.get("keywords") == ocr_key(scanned)
+    except Exception:
+        return False
 
 
 def parse_pages_arg(s):
@@ -1221,6 +1644,8 @@ def run_import(pdf, exam_id, out, args, exams_dir):
     ov = load_overrides(out / "overrides.json")
     doc, ocr = text_layer(pdf, out)
     pages = [Page(doc[i], i + 1) for i in range(doc.page_count)]
+    for p in pages:
+        p.scanned = p.num in ocr
     by_num = {p.num: p for p in pages}
 
     # Exam pages and anchors
@@ -1230,32 +1655,49 @@ def run_import(pdf, exam_id, out, args, exams_dir):
     if not rng:     # the exam starts at or after the Table of Information
         toi = next((p.num for p in pages if p.pg.search_for("TABLE OF INFORMATION")), None)
         if toi:
-            anchors, missing, cols = locate_anchors([p for p in scope if p.num >= toi])
+            anchors, missing = locate_anchors([p for p in scope if p.num >= toi], ocr)
     if not anchors:
-        anchors, missing, cols = locate_anchors(scope)
+        anchors, missing = locate_anchors(scope, ocr)
     if not anchors and not ov.get("crops"):
         raise Fatal("no questions found")
     if anchors:
         first, last = rng or (anchors[0].page, anchors[-1].page)
     else:
         first, last = rng or (1, doc.page_count)
-        cols = [Column(0, 0)]
     exam_nums = list(range(first, last + 1))
     exam_pages = [by_num[n] for n in exam_nums if n in by_num]
 
     rf = RunningFilter(exam_pages)
-    layout = Layout(by_num, exam_nums, cols, rf, ocr)
+    layout = Layout(by_num, exam_nums, anchors, rf, ocr)
+    for a in anchors:
+        a.col = layout.col_of(a.page, a.band, a.word.x0)
+    anchors, missing = fill_gaps(anchors, missing, layout, by_num)
 
     questions, sets, reference = {}, [], []
     gap_pages = {}
     if anchors:
-        bounds = [Boundary("q", a.n, a.n, a.page, a.col, a.word.y0) for a in anchors]
+        bounds = [Boundary("q", a.n, a.n, a.page, a.band, a.col, a.word.y0) for a in anchors]
         bounds += find_stems(layout, exam_pages)
         # On the first page, content above the first question (directions, the
-        # Table of Information) never belongs to a question.
-        layout.area_top[first] = min(b.y0 for b in bounds if b.page == first)
+        # Table of Information) never belongs to a question, unless question 1 says
+        # its figure is "above": then it starts below the directions paragraph.
+        q1_top = min(b.y0 for b in bounds if b.page == first)
+        layout.area_top[first] = q1_top
+        q1 = anchors[0]
+        x0, x1 = layout.col_range(q1.page, q1.band, q1.col)
+        if q1.page == first and layout.says_above(first, x0, x1, q1.word.y0):
+            p = by_num[first]
+            dirs = sorted((ln.bbox for ln in p.lines if ln.bbox[3] < q1_top), key=lambda b: b[1])
+            start = next((i for i, ln in enumerate(p.lines) if ln.text.lower().startswith("directions")
+                          and ln.bbox[3] < q1_top), None)
+            if start is not None:
+                y = p.lines[start].bbox[3]
+                for b in dirs:      # the rest of the directions paragraph
+                    if b[1] > y - 2 and b[1] - y < 6:
+                        y = max(y, b[3])
+                layout.area_top[first] = y + 2
         segs = layout.segments(bounds)
-        order = sorted(bounds, key=lambda b: (b.page, b.col, b.y0))
+        order = sorted(bounds, key=lambda b: (b.page, b.band, b.col, b.y0))
         for i, b in enumerate(order):
             if b.kind == "q":
                 questions[b.n] = {"segments": segs[b], "override": False}
@@ -1263,17 +1705,22 @@ def run_import(pdf, exam_id, out, args, exams_dir):
                 nxt = next((x.n for x in order[i + 1:] if x.kind == "q"), None)
                 sets.append({"first": b.n, "last": b.last, "segments": segs[b], "stemFirst": nxt})
         reference = find_reference(layout, pages, anchors)
-        prev = {a.n: a.page for a in anchors}
-        for n in missing:
-            gap_pages[n] = prev.get(n - 1) or prev.get(n + 1)
+        for n in missing:       # the page of the nearest question found
+            gap_pages[n] = min(anchors, key=lambda a: (abs(a.n - n), a.n)).page
 
     # Answer key, conversion table, rule and time
     key, conflicts, key_pages = find_key(pages, last)
+    key_scanned = bool(key and set(key_pages) & ocr)
+    ocr_key_max = max(key) if key else None
+    if key_scanned:     # OCR misreads letters silently: answers must come from overrides.json
+        key, conflicts = {}, []
     scale, dups, scale_page = find_scale(pages, last)
     texts = [(p.num, re.sub(r"\s+", " ", p.text)) for p in pages if p.num <= first or p.num > last]
     rule, rsrc, rule_page, rule_problem = detect_rule(texts)
     minutes, _ = detect_time(texts)
     expected_guess = max(key) if key else None
+    if key_scanned:
+        expected_guess = max(ocr_key_max, anchors[-1].n if anchors else 0)
 
     ex = {
         "questions": questions, "answers": key, "sets": sets, "reference": reference,
@@ -1282,7 +1729,7 @@ def run_import(pdf, exam_id, out, args, exams_dir):
         "rounding": detect_rounding(texts),
         "time": (minutes, "text") if minutes else (None, "inferred"),
         "expected": expected_guess, "keyPages": key_pages, "keyConflicts": conflicts,
-        "gapPages": gap_pages, "ignore": set(),
+        "gapPages": gap_pages, "ignore": set(), "keyScanned": key_scanned,
     }
     ex = apply_overrides(ex, ov)
     ex["overriddenAnswers"] = {int(q) for q in ov.get("answers", {})}
