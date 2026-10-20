@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python tools/importer.py *)",
+      "Bash(.venv/bin/python tools/importer.py *)",
+      "Read(./exams/**)",
+      "Edit(./exams/**/overrides.json)"
+    ],
+    "deny": [
+      "Read(./pdfs/**)",
+      "Read(./exams/**/source-ocr.pdf)"
+    ]
+  }
+}
