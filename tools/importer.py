@@ -43,13 +43,13 @@ STEM_RE = re.compile(r"^Questions?\s+(\d+)\s*(?:-|–|—|and|through|to)\s*(\d+
 CHOICE_RE = re.compile(r"^[({\[]([A-E])[)}\]]|^[({\[](C)c[)}\]]")    # OCR also reads "{B)", "(Cc)"
 # How OCR renders choice labels on scans: "©", "®)", "()", "‘D)", "(BE)", "(B". Never a bare letter.
 OCR_CHOICE_RE = re.compile(r"^(?:[©®@]\)?|\(\)|[(‘'`{\[|]?[A-Ea-e8©@®]{1,2}[)}\]|]|[({\[|][A-Ea-e8©@®]{1,2}[)}\]|]?)$")
-OCR_ANCHOR_RE = re.compile(r"^([0-9ilI|!]{1,3})[.,]$")      # OCR reads "14." as "i4." or "14,"
+OCR_ANCHOR_RE = re.compile(r"^([0-9ilI|!OoBSZ]{1,3})[.,]$")    # OCR reads "14." as "i4." or "14,", "80." as "BO."
 OCR_SETTINGS = "pgre-ocr-v2: --deskew --rotate-pages --force-ocr --pages <scanned> --tesseract-pagesegmode 4"
 LETTER_RE = re.compile(r"^\(?([A-E])\)?$")
 KEYNUM_RE = re.compile(r"^\d{1,3}\.?$")
 PPLUS_RE = re.compile(r"^(\d{1,3})%?$")
 FOOTER_RE = re.compile(
-    r"^(go\s*on to the next page\.?|stop\.?|.*\btime is called\b.*|.*\bcheck your work\b.*"
+    r"^(go\s*on to the next page[.,]?|go\s*on to the|next page[.,]?|stop\.?|.*\btime is called\b.*|.*\bcheck your work\b.*"
     r"|.*\bwork on this test\b.*|this test\.|do not turn this page.*|scratch work"
     r"|.*\bunauthorized copying\b.*|.*\bpage is illegal\.?)$", re.I)
 
@@ -236,6 +236,10 @@ class RunningFilter:
             return False
         if re.fullmatch(r"[-–—\s]*\d{1,3}[-–—\s]*", text):     # a page number
             return True
+        cy = (ln.bbox[1] + ln.bbox[3]) / 2
+        if page.scanned and len(text) <= 3 and re.search(r"\d", text) and not re.search(r"[.,:;]$", text) \
+                and not 0.1 * page.height < cy < 0.9 * page.height:     # OCR reads page "18" as "1s"
+            return True
         best = self.lines.get((b, line_key(text)))
         return best is not None and abs(ln.bbox[1] - best) <= 3
 
@@ -318,9 +322,23 @@ def build_items(page, rf, scanned=False):
             if box in rules:
                 excluded.append(box)
                 continue
-            covered = sum(area(intersect(box, grow(w, 1)) or (0, 0, 0, 0)) for w in all_words)
-            if covered < 0.5 * area(box):
+            near = [w for w in all_words if intersect(box, grow(w, 1))]
+            if near and all(any(intersect(w, grow(x, 0.5)) for x in excluded) for w in near):
+                excluded.append(box)        # the ink of a footer or page number
+                continue
+            covered = sum(area(intersect(box, grow(w, 1)) or (0, 0, 0, 0)) for w in near)
+            # Keep ink that OCR missed: a mostly-text blob still counts if it reaches
+            # well above or below the words covering it (a choice line OCR dropped).
+            reach = union(near) if near else None
+            if covered < 0.5 * area(box) or reach[1] - box[1] > 5 or box[3] - reach[3] > 5:
                 items.append(Item(box, "d"))
+        # A page number OCR missed: small ink alone in the top or bottom band.
+        for it in [i for i in items if i.kind == "d"]:
+            b = it.bbox
+            if band_of(page, b) and b[2] - b[0] <= 40 and b[3] - b[1] <= 16 and not any(
+                    o is not it and intersect(grow(b, 15), o.bbox) for o in items):
+                items.remove(it)
+                excluded.append(b)
     return items, excluded
 
 
@@ -436,10 +454,10 @@ def anchor_number(text, ocr=False):
     m = ANCHOR_RE.match(text) or GLUED_RE.match(text)
     if m:
         return int(m.group(1))
-    if ocr:     # needs a real digit, so Roman-numeral statements ("II.") never qualify
+    if ocr:     # needs a digit or a digit look-alike other than I, so "II." never qualifies
         m = OCR_ANCHOR_RE.match(text)
-        if m and re.search(r"\d", m.group(1)):
-            return int(m.group(1).translate(str.maketrans("ilI|!", "11111")))
+        if m and re.search(r"[\dOoBSZ]", m.group(1)):
+            return int(m.group(1).translate(str.maketrans("ilI|!OoBSZ", "1111100852")))
     return None
 
 

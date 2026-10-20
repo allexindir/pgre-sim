@@ -180,6 +180,7 @@ def test_ocr_tolerance():
     assert I.anchor_number("i4.", ocr=True) == 14 and I.anchor_number("25,", ocr=True) == 25
     assert I.anchor_number("4|.", ocr=True) == 41
     assert I.anchor_number("II.", ocr=True) is None and I.anchor_number("I.", ocr=True) is None
+    assert I.anchor_number("BO.", ocr=True) == 80 and I.anchor_number("BO.") is None
     assert I.choice_of("(A)") == "A" and I.choice_of("{B)") == "B" and I.choice_of("(Cc)") == "C"
     assert I.choice_of("(Be)") is None
     for t in ("©", "®)", "()", "‘D)", "(BE)", "(B", "A)"):
@@ -202,6 +203,13 @@ def test_gap_filled_from_a_bare_period():
     lay, anchors, _ = _layout(_doc([q1 + q2 + q3]))
     found, missing = I.fill_gaps(anchors, [2], lay, lay.pages)
     assert [a.n for a in found] == [1, 2, 3] and missing == []
+
+
+def test_ocr_footer_variants():
+    for t in ("GO ON TO THE NEXT PAGE.", "GOON TO THE NEXT PAGE,", "GO ON TO THE", "NEXT PAGE.", "SCRATCH WORK",
+              "Unauthorized copying or reuse of", "any part of this page is illegal."):
+        assert I.FOOTER_RE.match(t), t
+    assert not I.FOOTER_RE.match("The ball comes to a stop on the next page of ice.")
 
 
 def test_page_numbers_are_footers():
