@@ -362,6 +362,16 @@ def test_end_to_end_big_two_column_book(tmp_path, capsys):
     assert exam["title"] == "gr synth"
 
 
+def test_crops_stay_clear_of_excluded_marks():
+    content = (60, 100, 300, 200)
+    padded = (54, 94, 306, 206)
+    divider, header_rule, inside = (306, 64, 306, 724), (54, 96, 558, 96), (100, 150, 558, 150)
+    assert I.clear_of(padded, content, [divider]) == (54, 94, 305, 206)
+    assert I.clear_of(padded, content, [header_rule]) == (54, 97, 306, 206)
+    assert I.clear_of(padded, content, [(54, 203, 300, 203)]) == (54, 94, 306, 202)
+    assert I.clear_of(padded, content, [inside]) == padded  # crosses the content: kept
+
+
 def test_pixel_trim_finds_ink():
     doc = pymupdf.open()
     p = doc.new_page(width=612, height=792)

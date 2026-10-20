@@ -217,22 +217,42 @@ class Item:
 
 
 def build_items(page, rf):
-    items = []
+    """Content items on a page, plus the marks deliberately left out (headers,
+    footers, page rules, column dividers) so crops can be kept clear of them."""
+    items, excluded = [], []
     for ln in page.lines:
-        if not rf.is_running(page, ln):
+        if rf.is_running(page, ln):
+            excluded += [w.bbox for w in ln.words]
+        else:
             items += [Item(w.bbox, "w", w.text) for w in ln.words]
     W, H = page.width, page.height
     for r in page.drawings():
         w, h = r[2] - r[0], r[3] - r[1]
-        if rf.is_running_rect(r) or w * h > 0.4 * W * H:
-            continue
-        if min(w, h) < 2 and (h > 0.8 * H or w > 0.8 * W):
-            continue
-        items.append(Item(r, "d"))
+        if rf.is_running_rect(r) or w * h > 0.4 * W * H or (min(w, h) < 2 and (h > 0.8 * H or w > 0.8 * W)):
+            excluded.append(r)
+        else:
+            items.append(Item(r, "d"))
     for r in page.images():
         if area(r) <= 0.6 * W * H:
             items.append(Item(r, "i"))
-    return items
+    return items, excluded
+
+
+def clear_of(box, content, excluded, gap=1.0):
+    """Pull the padded crop's edges back from excluded marks that lie outside the content."""
+    x0, y0, x1, y1 = box
+    for r in excluded:
+        if not intersect(r, (x0, y0, x1, y1)) or intersect(r, content):
+            continue
+        if r[0] >= content[2]:
+            x1 = min(x1, r[0] - gap)
+        elif r[2] <= content[0]:
+            x0 = max(x0, r[2] + gap)
+        elif r[1] >= content[3]:
+            y1 = min(y1, r[1] - gap)
+        elif r[3] <= content[1]:
+            y0 = max(y0, r[3] + gap)
+    return (x0, y0, x1, y1)
 
 
 def boxes_in(items, region):
@@ -446,7 +466,11 @@ class Layout:
     def items(self, num):
         if num not in self._items:
             self._items[num] = build_items(self.pages[num], self.rf)
-        return self._items[num]
+        return self._items[num][0]
+
+    def excluded(self, num):
+        self.items(num)
+        return self._items[num][1]
 
     def content_box(self, num):
         its = self.items(num)
@@ -475,7 +499,8 @@ class Layout:
         boxes = boxes_in(self.items(num), region)
         if not boxes:
             return region
-        return intersect(grow(union(boxes), PAD), region) or region
+        content = union(boxes)
+        return clear_of(intersect(grow(content, PAD), region) or region, content, self.excluded(num))
 
     def has_content(self, num, region):
         return bool(boxes_in(self.items(num), region))
