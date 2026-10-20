@@ -8,6 +8,7 @@ A local, static exam simulator for GRE Physics practice tests. The full spec is 
 - `runner/` is the static HTML/JS app: vanilla ES modules, no dependencies, no build step.
 
 ## Commands
+- Setup (once): `python3.12 -m venv .venv && .venv/bin/pip install -r tools/requirements.txt`; run `source .venv/bin/activate` first so `python` resolves
 - Import: `python tools/importer.py pdfs/<file>.pdf [--id ID] [--expected N]`
 - Inspect a page as text: `python tools/importer.py pdfs/<file>.pdf --debug-page P`
 - Serve: `python -m http.server 8000`, then open http://localhost:8000/runner/ (add `?proof=<id>` to spot-check an import)
