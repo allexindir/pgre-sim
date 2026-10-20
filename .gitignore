@@ -1,0 +1,12 @@
+# ETS content: local only, never committed
+pdfs/
+exams/*/img/
+exams/*/review/
+exams/*/source-ocr.pdf
+
+# Local environment
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
